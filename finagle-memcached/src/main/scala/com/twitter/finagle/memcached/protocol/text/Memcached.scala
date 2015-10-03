@@ -1,18 +1,21 @@
 package com.twitter.finagle.memcached.protocol.text
 
+import org.jboss.netty.buffer.ChannelBuffer
+import org.jboss.netty.channel._
+
+import scala.collection.immutable
+
 import client.DecodingToResponse
 import client.{Decoder => ClientDecoder}
 import server.DecodingToCommand
 import server.{Decoder => ServerDecoder}
+
 import com.twitter.finagle._
 import com.twitter.finagle.memcached.protocol._
 import com.twitter.finagle.memcached.util.ChannelBufferUtils._
 import com.twitter.finagle.tracing._
 import com.twitter.finagle.stats.{NullStatsReceiver, StatsReceiver}
-import org.jboss.netty.buffer.ChannelBuffer
-import org.jboss.netty.channel._
-import org.jboss.netty.util.CharsetUtil.UTF_8
-import scala.collection.immutable
+import com.twitter.io.Buf
 
 object Memcached {
   def apply(stats: StatsReceiver = NullStatsReceiver) = new Memcached(stats)
@@ -64,9 +67,13 @@ class Memcached(stats: StatsReceiver) extends CodecFactory[Command, Response] {
 
       // pass every request through a filter to create trace data
       override def prepareConnFactory(underlying: ServiceFactory[Command, Response]) =
-        new MemcachedTracingFilter() andThen new MemcachedLoggingFilter(stats) andThen underlying
+        new MemcachedLoggingFilter(stats) andThen underlying
+
+      override def newTraceInitializer = MemcachedTraceInitializer.Module
     }
   }
+
+  override val protocolLibraryName: String = "memcached"
 }
 
 /**
@@ -74,32 +81,34 @@ class Memcached(stats: StatsReceiver) extends CodecFactory[Command, Response] {
  * Including command name, when request was sent and when it was received.
  */
 private class MemcachedTracingFilter extends SimpleFilter[Command, Response] {
-  def apply(command: Command, service: Service[Command, Response]) = Trace.unwind {
-    Trace.recordRpcname("memcached", command.name)
+  def apply(command: Command, service: Service[Command, Response]) = {
+    Trace.recordServiceName("memcached")
+    Trace.recordRpc(command.name)
     Trace.record(Annotation.ClientSend())
 
-    service(command) map { response =>
-      response match {
+    val response = service(command)
+    if (Trace.isActivelyTracing) {
+      response onSuccess  {
         case Values(values) =>
           command match {
             case cmd: RetrievalCommand =>
-              val keys = immutable.Set(cmd.keys map { _.toString(UTF_8) }: _*)
+              val keys: immutable.Set[String] = immutable.Set(cmd.keys map { case Buf.Utf8(s) => s }: _*)
               val hits = values.map {
                 case value =>
-                  Trace.recordBinary(value.key.toString(UTF_8), "Hit")
-                  value.key.toString(UTF_8)
+                  val Buf.Utf8(keyStr) = value.key
+                  Trace.recordBinary(keyStr, "Hit")
+                  keyStr
               }
-              val misses = keys -- hits
-              misses foreach { k =>
-                Trace.recordBinary(k.toString(UTF_8), "Miss")
-              }
-              case _ => response
+              val misses: immutable.Set[String] = keys -- hits
+              misses foreach { k: String => Trace.recordBinary(k, "Miss") }
+              case _ =>
           }
-        case _  => response
+        case _  =>
+      } ensure {
+        Trace.record(Annotation.ClientRecv())
       }
-      Trace.record(Annotation.ClientRecv())
-      response
     }
+    response
   }
 }
 

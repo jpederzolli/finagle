@@ -1,18 +1,23 @@
 package com.twitter.finagle.thrift
 
-import com.twitter.finagle.{ServiceProxy, Service, WriteException, ServiceException}
+import com.twitter.finagle.{Status, ServiceProxy, Service, WriteException, ServiceException}
 import java.util.logging.{Logger, Level}
 import org.apache.thrift.TApplicationException
 import org.apache.thrift.protocol.{TProtocolFactory, TMessageType}
 import org.apache.thrift.transport.TMemoryInputTransport
 import com.twitter.util.Future
 
+/**
+ * Indicates that the connection on which a Thrift request was issued
+ * is invalid, where "validity" is determined by
+ * [[com.twitter.finagle.thrift.ValidateThriftService]].
+ */
 case class InvalidThriftConnectionException() extends ServiceException {
   override def getMessage = "the thrift connection was invalidated"
 }
 
 /**
- * A filter that invalidates the a connection if it suffers an
+ * A filter that invalidates a connection if it suffers from an
  * irrecoverable application exception.
  *
  * Amazingly, an Apache Thrift server will leave a connection in a
@@ -39,8 +44,10 @@ class ValidateThriftService(
       }
     }
 
-  override def isAvailable = isValid && self.isAvailable
-
+  override def status = 
+    if (!isValid) Status.Closed 
+    else self.status
+  
   private def isResponseValid(bytes: Array[Byte]) = try {
     val memoryTransport = new TMemoryInputTransport(bytes)
     val iprot = protocolFactory.getProtocol(memoryTransport)
@@ -52,7 +59,7 @@ class ValidateThriftService(
         exc.getType == TApplicationException.UNKNOWN_METHOD
     }
   } catch {
-    case exc =>
+    case exc: Throwable =>
       Logger.getLogger("finagle-thrift").log(Level.WARNING,
         "Exception while validating connection", exc)
       false

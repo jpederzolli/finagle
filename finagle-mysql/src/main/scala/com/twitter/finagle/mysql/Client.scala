@@ -1,164 +1,160 @@
-package com.twitter.finagle.mysql
+package com.twitter.finagle.exp.mysql
 
-import com.twitter.finagle.mysql.util.Query
+import java.util.logging.Level
+import com.twitter.finagle.{ServiceProxy, ClientConnection, ServiceFactory}
+import com.twitter.finagle.stats.{NullStatsReceiver, StatsReceiver}
+import com.twitter.util._
 
 object Client {
   /**
-   * Constructs a Client given a ServiceFactory.
+   * Creates a new Client based on a ServiceFactory.
    */
-  def apply(factory: ServiceFactory[Request, Result]): Client = {
-    new Client(factory)
-  }
+  def apply(factory: ServiceFactory[Request, Result]): Client with Transactions = new StdClient(factory)
 
   /**
-   * Constructs a ServiceFactory using a single host.
+   * Constructs a Client using a single host.
    * @param host a String of host:port combination.
    * @param username the username used to authenticate to the mysql instance
    * @param password the password used to authenticate to the mysql instance
    * @param dbname database to initially use
+   * @param logLevel log level for logger used in the finagle ChannelSnooper
+   * and the finagle-mysql netty pipeline.
+   * @param statsReceiver collects finagle stats scoped to "mysql"
    */
-  def apply(host: String, username: String, password: String, dbname: Option[String]): Client = {
-    val factory = ClientBuilder()
-      .codec(new MySQL(username, password, dbname))
-      .hosts(host)
-      .hostConnectionLimit(1)
-      .buildFactory()
+  @deprecated("Use the com.twitter.finagle.exp.Mysql object to build a client", "6.6.2")
+  def apply(
+    host: String,
+    username: String,
+    password: String,
+    dbname: String = null,
+    logLevel: Level = Level.OFF,
+    statsReceiver: StatsReceiver = NullStatsReceiver
+  ): Client = {
+    val factory = com.twitter.finagle.exp.Mysql.client
+      .withCredentials(username, password)
+      .withDatabase(dbname)
+      .newClient(host)
 
       apply(factory)
   }
-
-  def apply(host: String, username: String, password: String): Client = {
-    apply(host, username, password, None)
-  }
-
-  def apply(host: String, username: String, password: String, dbname: String): Client = {
-    apply(host, username, password, Some(dbname))
-  }
 }
 
-class Client(factory: ServiceFactory[Request, Result]) {
-  private[this] lazy val fService = factory.apply()
+trait Client extends Closable {
+  /**
+   * Returns the result of executing the `sql` query on the server.
+   */
+  def query(sql: String): Future[Result]
 
   /**
-   * Sends a query to the server without using
-   * prepared statements.
-   * @param sql An sql statement to be executed.
-   * @return an OK Result or a ResultSet for queries that return
-   * rows.
+   * Sends the given `sql` to the server and maps each resulting row to
+   * `f`, a function from Row => T. If no ResultSet is returned, the function
+   * returns an empty Seq.
    */
-  def query(sql: String) = send(QueryRequest(sql)) {
-      case rs: ResultSet => Future.value(rs)
-      case ok: OK => Future.value(ok)
-  }
+  def select[T](sql: String)(f: Row => T): Future[Seq[T]]
 
   /**
-   * Runs a query that returns a result set. For each row
-   * in the ResultSet, call f on the row and return the results.
-   * @param sql A sql statement that returns a result set.
-   * @param f A function from ResultSet to any type T.
-   * @return a Future of Seq[T]
+   * Returns a new PreparedStatement instance based on the given sql query.
+   * The returned prepared statement can be reused and applied with varying
+   * parameters.
+   *
+   * @note Mysql prepared statements are stateful, that is, they allocate
+   * resources on the mysql server. The allocations are managed by a
+   * finagle-mysql connection. Closing the client implicitly closes all
+   * outstanding PreparedStatements.
    */
-  def select[T](sql: String)(f: Row => T): Future[Seq[T]] = query(sql) map {
-    case rs: ResultSet => rs.rows.map(f)
-    case ok: OK => Seq()
-  }
+  def prepare(sql: String): PreparedStatement
 
   /**
-   * Sends a query to server to be prepared for execution.
-   * @param sql A query to be prepared on the server.
-   * @return PreparedStatement
+   * Returns the result of pinging the server.
    */
-  def prepare(sql: String, params: Any*) = {
-    val stmt = Query.expandParams(sql, params)
-    send(PrepareRequest(stmt)) {
-      case ps: PreparedStatement =>
-        ps.statement.setValue(stmt)
-        if(params.size > 0)
-          ps.parameters = Query.flatten(params).toArray
+  def ping(): Future[Result]
+}
 
-        Future.value(ps)
+trait Transactions {
+  /**
+   * Execute `f` in a transaction.
+   *
+   * If `f` throws an exception, the transaction is rolled back. Otherwise, the transaction is
+   * committed.
+   *
+   * @example {{{
+   *   client.transaction[Foo] { c =>
+   *    for {
+   *       r0 <- c.query(q0)
+   *       r1 <- c.query(q1)
+   *       response: Foo <- buildResponse(r1, r2)
+   *     } yield response
+   *   }
+   * }}}
+   *
+   * @note we use a ServiceFactory that returns the same Service repeatedly to the client. This is
+   * to assure that a new MySQL connection (i.e. Service) from the connection pool (i.e.,
+   * ServiceFactory) will be used for each new transaction. Only upon completion of the transaction
+   * is the connection returned to the pool for re-use.
+   */
+  def transaction[T](f: Client => Future[T]): Future[T]
+}
+
+private[mysql] class StdClient(factory: ServiceFactory[Request, Result])
+  extends Client with Transactions {
+  private[this] val service = factory.toService
+
+  def query(sql: String): Future[Result] = service(QueryRequest(sql))
+  def ping(): Future[Result] = service(PingRequest)
+
+  def select[T](sql: String)(f: Row => T): Future[Seq[T]] =
+    query(sql) map {
+      case rs: ResultSet => rs.rows.map(f)
+      case _ => Nil
     }
-  }
 
-  /**
-   * Execute a prepared statement.
-   * @return an OK Result or a ResultSet for queries that return
-   * rows.
-   */
-  def execute(ps: PreparedStatement) = send(ExecuteRequest(ps)) {
-    case rs: ResultSet =>
-      ps.bindParameters()
-      Future.value(rs)
-    case ok: OK =>
-      ps.bindParameters()
-      Future.value(ok)
-  }
-
-  /**
-   * Combines the prepare and execute operations.
-   * @return a Future[(PreparedStatement, Result)] tuple.
-   */
-  def prepareAndExecute(sql: String, params: Any*) =
-    prepare(sql, params: _*) flatMap { ps =>
-      execute(ps) map {
-        res => (ps, res)
+  def prepare(sql: String): PreparedStatement = new PreparedStatement {
+    def apply(ps: Parameter*): Future[Result] = factory() flatMap { svc =>
+      svc(PrepareRequest(sql)).flatMap {
+        case ok: PrepareOK => svc(ExecuteRequest(ok.id, ps.toIndexedSeq))
+        case r => Future.exception(new Exception("Unexpected result %s when preparing %s"
+          .format(r, sql)))
+      } ensure {
+        svc.close()
       }
     }
-
-
-  /**
-   * Runs a query that returns a result set. For each row
-   * in the ResultSet, call f on the row and return the results.
-   * @param ps A prepared statement.
-   * @param f A function from ResultSet to any type T.
-   * @return a Future of Seq[T]
-   */
-  def select[T](ps: PreparedStatement)(f: Row => T): Future[Seq[T]] = execute(ps) map {
-    case rs: ResultSet => rs.rows.map(f)
-    case ok: OK => Seq()
   }
 
-  /**
-   * Combines the prepare and select operations.
-   * @return a Future[(PreparedStatement, Seq[T])] tuple.
-   */
-  def prepareAndSelect[T](sql: String, params: Any*)(f: Row => T) =
-    prepare(sql, params: _*) flatMap { ps =>
-      select(ps)(f) map {
-          seq => (ps, seq)
+  def transaction[T](f: Client => Future[T]): Future[T] = {
+    val singleton = new ServiceFactory[Request, Result] {
+      val svc = factory()
+      // Because the `singleton` is used in the context of a `FactoryToService` we override
+      // `Service#close` to ensure that we can control the checkout lifetime of the `Service`.
+      val proxiedService = svc map { service =>
+        new ServiceProxy(service) {
+          override def close(deadline: Time) = Future.Done
+        }
       }
+
+      def apply(conn: ClientConnection) = proxiedService
+      def close(deadline: Time): Future[Unit] = svc.flatMap(_.close(deadline))
     }
 
-  /**
-   * Close a prepared statement on the server.
-   * @return OK result.
-   */
-  def closeStatement(ps: PreparedStatement) = send(CloseRequest(ps)) {
-    case ok: OK => Future.value(ok)
-  }
+    val client = Client(singleton)
+    val transaction = for {
+      _ <- client.query("START TRANSACTION")
+      result <- f(client)
+      _ <- client.query("COMMIT")
+    } yield result
 
-  def selectDB(schema: String) = send(UseRequest(schema)) {
-    case ok: OK => Future.value(ok)
-  }
+    // handle failures and put connection back in the pool
 
-  def ping = send(PingRequest) {
-    case ok: OK => Future.value(ok)
-  }
-
-  /**
-   * Close the ServiceFactory and its underlying resources.
-   */
-  def close() = factory.close()
-
-  /**
-   * Helper function to send requests to the ServiceFactory
-   * and handle Error responses from the server.
-   */
-  private[this] def send[T](r: Request)(handler: PartialFunction[Result, Future[T]])  =
-    fService flatMap { service =>
-      service(r) flatMap (handler orElse {
-        case Error(c, s, m) => Future.exception(ServerError(c + " - " + m))
-        case result         => Future.exception(ClientError("Unhandled result from server: " + result))
-      })
+    transaction transform {
+      case Return(r) =>
+        singleton.close()
+        Future.value(r)
+      case Throw(e) =>
+        client.query("ROLLBACK") transform { _ =>
+          singleton.close()
+          Future.exception(e)
+        }
     }
+  }
+
+  def close(deadline: Time): Future[Unit] = factory.close(deadline)
 }

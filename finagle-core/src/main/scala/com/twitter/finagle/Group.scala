@@ -1,9 +1,9 @@
 package com.twitter.finagle
 
 import com.twitter.finagle.builder.Cluster
-import com.twitter.finagle.util.{InetSocketAddressUtil, LoadService}
+import com.twitter.util._
 import java.net.SocketAddress
-import java.util.logging.Logger
+import java.util.concurrent.atomic.AtomicReference
 
 /**
  * A group is a dynamic set of `T`-typed values. It is used to
@@ -24,7 +24,29 @@ import java.util.logging.Logger
  * unfortunate, but it's better to keep things simpler and
  * consistent.
  */
+@deprecated("Use `com.twitter.finagle.Name` to represent clusters instead", "6.7.x")
 trait Group[T] { outer =>
+  // Group is needlessly complex due to it transitioning to
+  // deprecation. In order to provide reasonable compatibility with
+  // forthcoming structrures, we base the group implementation on Var
+  // while retaining its two key semantics:
+  //
+  //   (1) unchanged objects retain identity;
+  //   (2) collect & map are idempotent.
+  //
+  // The following are semi-internal, to be accessed only by Finagle
+  // itself.
+
+  protected[finagle] val set: Var[Set[T]]
+
+  // We use the ref here to preserve group semantics.  IE: retain object
+  // identity to repeated calls to Group.members
+  final protected[finagle] lazy val ref = {
+    val r = new AtomicReference[Set[T]]()
+    set.changes.register(Witness(r))
+    r
+  }
+
   /**
    * Create a new group by mapping each element of this group
    * with `f`. `f` is guaranteed to be invoked exactly once for each
@@ -38,116 +60,129 @@ trait Group[T] { outer =>
    * element of the group, even for dynamic groups.
    */
   def collect[U](f: PartialFunction[T, U]): Group[U] = new Group[U] {
-    @volatile var snap = Set[T]()
-    @volatile var current = Set[U]()
     var mapped = Map[T, U]()
-
-    def update() = synchronized {
-      val old = snap
-      snap = outer.members
-
-      mapped ++= (snap &~ old) collect {
-        case e if f.isDefinedAt(e) => e -> f(e)
-      }
-      mapped --= old &~ snap
-
-      current = Set() ++ mapped.values
-    }
-
-    update()
-
-    def members = {
-      if (outer.members ne snap) synchronized {
-        if (outer.members ne snap)
-          update()
+    var last = Set[T]()
+    protected[finagle] val set = outer.set map { set =>
+      synchronized {
+        mapped ++= (set &~ last) collect {
+          case el if f.isDefinedAt(el) => el -> f(el)
+        }
+        mapped --= last &~ set
+        last = set
       }
 
-      current
+      mapped.values.toSet
     }
   }
 
   /**
    * The current members of this group. If the group has not
-   * changed, the same object (ie. object identity holds) is returned.
+   * changed, the same object is returned. This allows a simple
+   * object identity check to be performed to see if the Group has
+   * been updated.
    */
-  def members: Set[T]
+  final def members: Set[T] = ref.get
+  final def apply(): Set[T] = members
 
-  /** Synonymous to `members` */
-  def apply(): Set[T] = members
+  /**
+   * Name the group `n`.
+   *
+   * @return `this` mixed in with `LabelledGroup`, named `n`
+   */
+  def named(n: String): Group[T] = LabelledGroup(this, n)
 
-  override def toString = "Group(%s)".format(members mkString ", ")
+  def +(other: Group[T]): Group[T] = new Group[T] {
+    protected[finagle] val set = for { a <- outer.set; b <- other.set } yield a++b
+  }
+
+  override def toString = "Group(%s)".format(this() mkString ", ")
 }
 
+/**
+ * A group that simply contains a name. Getting at the set binds the
+ * name, but mostly this is to ship names under the cover of old
+ * APIs. (And hopefully will be deprecated soon enough.)
+ */
+@deprecated("Use `com.twitter.finagle.Name` to represent clusters instead", "6.7.x")
+private[finagle] case class NameGroup(name: Name.Bound)
+  extends Group[SocketAddress] {
+    protected[finagle] lazy val set: Var[Set[SocketAddress]] = name.addr map {
+      case Addr.Bound(set, _) => set
+      case _ => Set()
+    }
+  }
+
+@deprecated("Use `com.twitter.finagle.Name` to represent clusters instead", "6.7.x")
 trait MutableGroup[T] extends Group[T] {
   def update(newMembers: Set[T])
 }
 
-trait GroupResolver extends (String => Group[SocketAddress]) {
-  val scheme: String
-}
-
-class GroupResolverNotFoundException(scheme: String)
-  extends Exception("Group resolver not found for scheme \"%s\"".format(scheme))
-
-class GroupDestinationInvalid(dest: String)
-  extends Exception("Group destination \"%s\" is not valid".format(dest))
-
-object InetGroupResolver extends GroupResolver {
-  val scheme = "inet"
-  def apply(addr: String) = {
-    val expanded = InetSocketAddressUtil.parseHosts(addr)
-    Group[SocketAddress](expanded:_*)
-  }
+/**
+ * A mixin trait to assign a ``name`` to the group. This is used
+ * to assign labels to groups that ascribe meaning to them.
+ */
+@deprecated("Use `com.twitter.finagle.Name` to represent clusters instead", "6.7.x")
+case class LabelledGroup[T](underlying: Group[T], name: String) extends Group[T] {
+  protected[finagle] lazy val set: Var[Set[T]] = underlying.set
 }
 
 object Group {
+  /**
+   * Construct a `T`-typed static group from the given elements.
+   *
+   * @param staticMembers the members of the returned static group
+   */
+  @deprecated("Use `com.twitter.finagle.Name` to represent clusters instead", "2014-11-21")
   def apply[T](staticMembers: T*): Group[T] = new Group[T] {
-    val members = Set(staticMembers:_*)
+    protected[finagle] val set = Var(Set(staticMembers:_*))
   }
 
+  def fromVarAddr(va: Var[Addr]): Group[SocketAddress] = new Group[SocketAddress] {
+    protected[finagle] val set = va map {
+      case Addr.Bound(sockaddrs, _) => sockaddrs
+      case _ => Set[SocketAddress]()
+    }
+  }
+
+  def fromVar[T](v: Var[Set[T]]): Group[T] = new Group[T] {
+    protected[finagle] val set = v
+  }
+
+  /**
+   * The empty group of type `T`.
+   */
+  @deprecated("Use `com.twitter.finagle.Name` to represent clusters instead", "2014-11-21")
   def empty[T]: Group[T] = Group()
 
+  /**
+   * Creates a mutable group of type `T`.
+   *
+   * @param initial the initial elements of the group
+   */
+  @deprecated("Use `com.twitter.finagle.Name` to represent clusters instead", "2014-11-21")
   def mutable[T](initial: T*): MutableGroup[T] = new MutableGroup[T] {
-    @volatile private[this] var current: Set[T] = Set(initial:_*)
-    def members = current
-    def update(newMembers: Set[T]) { current = newMembers }
+    protected[finagle] val set = Var(Set(initial:_*))
+    def update(newMembers: Set[T]) { set() = newMembers }
   }
 
-  def fromCluster[T](underlying: Cluster[T]): Group[T] = new Group[T] {
+  /**
+   * Construct a (dynamic) `Group` from the given
+   * [[com.twitter.finagle.builder.Cluster]]. Note that clusters
+   * are deprecated, so this constructor acts as a temporary
+   * bridge.
+   */
+  @deprecated("Use `com.twitter.finagle.Name` to represent clusters instead", "2014-11-21")
+  def fromCluster[T](underlying: Cluster[T]): Group[T] = {
     val (snap, edits) = underlying.snap
-    @volatile var current: Set[T] = snap.toSet
-    edits foreach { spool =>
-      spool foreach {
-        case Cluster.Add(t) => current += t
-        case Cluster.Rem(t) => current -= t
+    new Group[T] {
+      protected[finagle] val set = Var(snap.toSet)
+
+      edits foreach { spool =>
+        spool foreach {
+          case Cluster.Add(t) => set() += t
+          case Cluster.Rem(t) => set() -= t
+        }
       }
     }
-
-    def members = current
-  }
-
-  private lazy val resolvers = {
-    val rs = LoadService[GroupResolver]()
-    val log = Logger.getLogger(getClass.getName)
-    val resolvers = Seq(InetGroupResolver) ++ rs
-    for (r <- resolvers)
-      log.info("GroupResolver[%s] = %s(%s)".format(r.scheme, r.getClass.getName, r))
-    resolvers
-  }
-
-  def apply(dest: String): Group[SocketAddress] =
-    dest.split("!", 2) match {
-      case Array(scheme, addr) =>
-        val r = resolvers.find(_.scheme == scheme) getOrElse {
-          throw new GroupResolverNotFoundException(scheme)
-        }
-
-        r(addr)
-
-      case Array(addr) =>
-        InetGroupResolver(addr)
-
-      case _ =>
-        throw new GroupDestinationInvalid(dest)
   }
 }

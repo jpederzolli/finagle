@@ -3,41 +3,36 @@ package com.twitter.finagle.stress
 import com.twitter.conversions.time._
 import com.twitter.finagle.Service
 import com.twitter.finagle.builder.{ClientBuilder, ServerBuilder}
-import com.twitter.finagle.http.Http
+import com.twitter.finagle.httpx.{Fields, Http, Request, Response, Status}
 import com.twitter.finagle.stats.OstrichStatsReceiver
-import com.twitter.finagle.util.SharedTimer
+import com.twitter.finagle.util.DefaultTimer
 import com.twitter.ostrich.stats
 import com.twitter.util.{Future, Return, Throw, Stopwatch}
 import java.net.{SocketAddress, InetSocketAddress}
 import java.util.concurrent.CountDownLatch
-import org.jboss.netty.buffer.ChannelBuffers
-import org.jboss.netty.handler.codec.http.{
-  DefaultHttpRequest, HttpVersion, HttpResponseStatus, HttpMethod, HttpHeaders, HttpRequest
-  , HttpResponse, DefaultHttpResponse}
 
 object EndToEndStress {
   private[this] object HttpService
-    extends Service[HttpRequest, HttpResponse]
+    extends Service[Request, Response]
   {
-    def apply(request: HttpRequest) = Future {
-      val response = new DefaultHttpResponse(
-        request.getProtocolVersion, HttpResponseStatus.OK)
-      response.setHeader(HttpHeaders.Names.CONTENT_LENGTH, 1)
-      response.setContent(ChannelBuffers.wrappedBuffer(".".getBytes))
+    def apply(request: Request) = Future {
+      val response = Response(
+        request.version, Status.Ok)
+      response.headerMap.set(Fields.ContentLength, "1")
+      response.contentString = "."
       response
     }
   }
 
   @volatile private[this] var running = true
 
-  def dispatchLoop(service: Service[HttpRequest, HttpResponse], latch: CountDownLatch) {
+  def dispatchLoop(service: Service[Request, Response], latch: CountDownLatch) {
     if (!running) {
       latch.countDown()
       return
     }
 
-    val request = new DefaultHttpRequest(
-      HttpVersion.HTTP_1_1, HttpMethod.GET, "/")
+    val request = Request("/")
 
     val elapsed = Stopwatch.start()
 
@@ -74,11 +69,10 @@ object EndToEndStress {
     val latch = new CountDownLatch(concurrency)
     val elapsed = Stopwatch.start()
 
-    val timer = SharedTimer.acquire()
     val server = buildServer()
-    val client = buildClient(concurrency, server.localAddress)
+    val client = buildClient(concurrency, server.boundAddress)
 
-    timer.twitter.schedule(10.seconds) {
+    DefaultTimer.twitter.schedule(10.seconds) {
       println("@@ %ds".format(elapsed().inSeconds))
       Stats.prettyPrintStats()
     }
@@ -91,7 +85,6 @@ object EndToEndStress {
         latch.await()
         client.close()
         server.close()
-        timer.dispose()
         println("Shutdown took %dms".format(System.currentTimeMillis()-start))
       }
     })

@@ -1,10 +1,20 @@
-/* CHANGING THIS FILE REQUIRES MANUAL REGENERATION */
+/* 
+		CHANGING THIS FILE REQUIRES MANUAL REGENERATION 
+		
+E.g.:
+
+thrift --gen java tracing.thrift
+cd gen-java
+find . -type f -print0 | cpio -pmud0 ../../java
+
+*/
 
 /**
  * Define thrift structs for thrift request tracing.
  */
 
 namespace java com.twitter.finagle.thrift.thrift
+#@namespace scala com.twitter.finagle.thrift.thriftscala
 namespace rb FinagleThrift
 
 /**
@@ -13,10 +23,18 @@ namespace rb FinagleThrift
  */
 
 // these are the annotations we always expect to find in a span
+const string WIRE_SEND = "ws"
+const string WIRE_RECV = "wr"
 const string CLIENT_SEND = "cs"
 const string CLIENT_RECV = "cr"
 const string SERVER_SEND = "ss"
 const string SERVER_RECV = "sr"
+const string SERVER_ADDR = "sa"
+const string CLIENT_ADDR = "ca"
+const string CLIENT_SEND_FRAGMENT = "csf"
+const string CLIENT_RECV_FRAGMENT = "crf"
+const string SERVER_SEND_FRAGMENT = "ssf"
+const string SERVER_RECV_FRAGMENT = "srf"
 
 // this represents a host and port in a network
 struct Endpoint {
@@ -63,6 +81,22 @@ struct ClientId {
 }
 
 /**
+ * This struct serializes com.twitter.finagle.Context
+ */
+struct RequestContext {
+  1: binary key,
+  2: binary value
+}
+
+/**
+ * Serializes an individual delegation.
+ */
+struct Delegation {
+  1: string src
+  2: string dst
+}
+
+/**
  * The following are for finagle-thrift specific tracing headers &
  * negotiation.
  */
@@ -78,6 +112,11 @@ struct RequestHeader {
   5: optional bool sampled // if true we should trace the request, if not set we have not decided.
   6: optional ClientId client_id
   7: optional i64 flags // contains various flags such as debug mode on/off
+  8: list<RequestContext> contexts
+
+  // Support for destination (partially resolved names) and delegation tables.
+  9: optional string dest
+  10: optional list<Delegation> delegations
 }
 
 /**
@@ -87,6 +126,7 @@ struct RequestHeader {
  */
 struct ResponseHeader {
   1: list<Span> spans
+  2: list<RequestContext> contexts
 }
 
 /**

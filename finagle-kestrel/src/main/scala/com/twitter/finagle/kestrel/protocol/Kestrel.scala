@@ -9,8 +9,10 @@ import client.{Decoder => ClientDecoder}
 import com.twitter.finagle.{ServiceFactory, Codec, CodecFactory}
 import com.twitter.finagle.tracing.ClientRequestTracingFilter
 
-class Kestrel extends CodecFactory[Command, Response] {
+class Kestrel(failFast: Boolean) extends CodecFactory[Command, Response] {
   private[this] val storageCommands = collection.Set[ChannelBuffer]("set")
+
+  def this() = this(false)
 
   def server = Function.const {
     new Codec[Command, Response] {
@@ -50,9 +52,11 @@ class Kestrel extends CodecFactory[Command, Response] {
       override def prepareConnFactory(underlying: ServiceFactory[Command, Response]) =
         new KestrelTracingFilter() andThen underlying
 
-      override def failFastOk = false
+      override def failFastOk = failFast
     }
   }
+
+  override val protocolLibraryName: String = "kestrel"
 }
 
 /**
@@ -65,6 +69,11 @@ private class KestrelTracingFilter extends ClientRequestTracingFilter[Command, R
 }
 
 object Kestrel {
-  def apply() = new Kestrel
+  def apply(): CodecFactory[Command, Response] = apply(false)
+  /**
+   * NOTE: If you're using the codec to build a client connected to a single host, don't set this
+   * to true. See CSL-288
+   */
+  def apply(failFast: Boolean): CodecFactory[Command, Response] = new Kestrel(failFast)
   def get() = apply()
 }

@@ -15,6 +15,17 @@ object Del {
   def apply(args: => Seq[Array[Byte]]) = new Del(args.map(ChannelBuffers.wrappedBuffer(_)))
 }
 
+case class Dump(key: ChannelBuffer) extends StrictKeyCommand {
+  def command = Commands.DUMP
+  def toChannelBuffer = RedisCodec.toUnifiedFormat(Seq(CommandBytes.DUMP, key))
+}
+object Dump {
+  def apply(args: Seq[Array[Byte]]) = {
+    val list = trimList(args, 1, "DUMP")
+    new Dump(ChannelBuffers.wrappedBuffer(list(0)))
+  }
+}
+
 case class Exists(key: ChannelBuffer) extends StrictKeyCommand {
   def command = Commands.EXISTS
   def toChannelBuffer = RedisCodec.toUnifiedFormat(Seq(CommandBytes.EXISTS, key))
@@ -28,7 +39,6 @@ object Exists {
 
 case class Expire(key: ChannelBuffer, seconds: Long) extends StrictKeyCommand {
   def command = Commands.EXPIRE
-  RequireClientProtocol(seconds > 0, "Seconds must be greater than 0")
   def toChannelBuffer =
     RedisCodec.toUnifiedFormat(Seq(CommandBytes.EXPIRE, key,
       StringToChannelBuffer(seconds.toString)))
@@ -45,9 +55,6 @@ object Expire {
 
 case class ExpireAt(key: ChannelBuffer, timestamp: Time) extends StrictKeyCommand {
   def command = Commands.EXPIREAT
-  RequireClientProtocol(
-    timestamp != null && timestamp > Time.now,
-    "Timestamp must be in the future")
 
   val seconds = timestamp.inSeconds
 
@@ -75,6 +82,20 @@ object Keys {
   def apply(args: Seq[Array[Byte]]) = new Keys(ChannelBuffers.wrappedBuffer(args.head))
 }
 
+case class Move(key: ChannelBuffer, db: ChannelBuffer) extends StrictKeyCommand {
+  def command = Commands.MOVE
+  RequireClientProtocol(db != null && db.readableBytes > 0, "Database must be specified")
+  def toChannelBuffer =
+    RedisCodec.toUnifiedFormat(Seq(CommandBytes.MOVE, key, db))
+}
+object Move {
+  def apply(args: Seq[Array[Byte]]) = {
+    val list = trimList(args, 2, "MOVE")
+    new Move(ChannelBuffers.wrappedBuffer(list(0)),
+      ChannelBuffers.wrappedBuffer(list(1)))
+  }
+}
+
 case class Persist(key: ChannelBuffer) extends StrictKeyCommand {
   def command = Commands.PERSIST
   def toChannelBuffer = RedisCodec.toUnifiedFormat(Seq(CommandBytes.PERSIST, key))
@@ -83,6 +104,53 @@ object Persist {
   def apply(args: Seq[Array[Byte]]) = {
     val list = trimList(args, 1, "PERSIST")
     new Persist(ChannelBuffers.wrappedBuffer(list(0)))
+  }
+}
+
+case class PExpire(key: ChannelBuffer, milliseconds: Long) extends StrictKeyCommand {
+  def command = Commands.PEXPIRE
+  def toChannelBuffer =
+    RedisCodec.toUnifiedFormat(Seq(CommandBytes.PEXPIRE, key,
+      StringToChannelBuffer(milliseconds.toString)))
+}
+object PExpire {
+  def apply(args: Seq[Array[Byte]]) = {
+    val list = trimList(args, 2, "PEXPIRE")
+    RequireClientProtocol.safe {
+      new PExpire(ChannelBuffers.wrappedBuffer(list(0)),
+        NumberFormat.toLong(BytesToString(list(1))))
+    }
+  }
+}
+
+case class PExpireAt(key: ChannelBuffer, timestamp: Time) extends StrictKeyCommand {
+  def command = Commands.PEXPIREAT
+
+  val milliseconds = timestamp.inMilliseconds
+
+  def toChannelBuffer =
+    RedisCodec.toUnifiedFormat(Seq(CommandBytes.PEXPIREAT, key,
+      StringToChannelBuffer(milliseconds.toString)))
+}
+object PExpireAt {
+  def apply(args: Seq[Array[Byte]]) = {
+    val list = trimList(args, 2, "PEXPIREAT")
+    val millisecondsString = BytesToString(list(1))
+    val milliseconds = RequireClientProtocol.safe {
+      Time.fromMilliseconds(NumberFormat.toLong(millisecondsString))
+    }
+    new PExpireAt(ChannelBuffers.wrappedBuffer(list(0)), milliseconds)
+  }
+}
+
+case class PTtl(key: ChannelBuffer) extends StrictKeyCommand {
+  def command = Commands.PTTL
+  def toChannelBuffer = RedisCodec.toUnifiedFormat(Seq(CommandBytes.PTTL, key))
+}
+object PTtl {
+  def apply(args: Seq[Array[Byte]]) = {
+    val list = trimList(args, 1, "PTTL")
+    new PTtl(ChannelBuffers.wrappedBuffer(list(0)))
   }
 }
 

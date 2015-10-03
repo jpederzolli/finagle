@@ -1,52 +1,126 @@
 package com.twitter.finagle.mux
 
-import org.jboss.netty.buffer.{ChannelBuffer, ChannelBuffers}
-import org.jboss.netty.util.CharsetUtil
 import com.twitter.finagle.tracing.{SpanId, TraceId, Flags}
+import com.twitter.finagle.{Dtab, Dentry, NameTree, Path}
+import com.twitter.io.{Buf, Charsets}
+import com.twitter.util.{Duration, Time}
+import org.jboss.netty.buffer.{ChannelBuffer, ChannelBuffers}
 
+/**
+ * Indicates that encoding or decoding of a Mux message failed.
+ * Reason for failure should be provided by the `why` string.
+ */
 case class BadMessageException(why: String) extends Exception(why)
 
 // TODO: when the new com.twitter.codec.Codec arrives, define Message
 // parsing as a bijection between ChannelBuffers and Message.
 
-private sealed trait Message {
-  val typ: Byte
-  val tag: Int
-  val buf: ChannelBuffer
+/** A mux request. */
+trait Request {
+  /** The destination name specified by Tdispatch requests. Otherwise, Path.empty */
+  def destination: Path
+
+  /** The payload of the request. */
+  def body: Buf
 }
 
-private object Message {
+object Request {
+  private[this] case class Impl(destination: Path, body: Buf) extends Request {
+    override def toString = s"mux.Request.Impl($destination, $body)"
+  }
+
+  val empty: Request = Impl(Path.empty, Buf.Empty)
+
+  def apply(dst: Path, payload: Buf): Request = Impl(dst, payload)
+}
+
+/** For java compatibility */
+object Requests {
+  val empty: Request = Request.empty
+
+  def make(dst: Path, payload: Buf): Request = Request(dst, payload)
+}
+
+/** A mux response containing an immutable byte buffer. */
+trait Response {
+  /** The payload of the response. */
+  def body: Buf
+}
+
+object Response {
+  private[this] case class Impl(body: Buf) extends Response {
+    override def toString = s"mux.Response.Impl($body)"
+  }
+
+  val empty: Response = Impl(Buf.Empty)
+
+  def apply(buf: Buf): Response = Impl(buf)
+}
+
+/** For java compatibility */
+object Responses {
+  val empty: Response = Response.empty
+
+  def make(payload: Buf): Response = Response(payload)
+}
+
+/**
+ * Documentation details are in the [[com.twitter.finagle.mux]] package object.
+ */
+private[finagle] sealed trait Message {
+  /**
+   * Values should correspond to the constants defined in
+   * [[com.twitter.finagle.mux.Message.Types]]
+   */
+  def typ: Byte
+
+  /** Only 3 of its bytes are used. */
+  def tag: Int
+
+  def buf: ChannelBuffer
+}
+
+private[finagle] object Message {
   object Types {
     // Application messages:
     val Treq = 1: Byte
     val Rreq = -1: Byte
 
+    val Tdispatch = 2: Byte
+    val Rdispatch = -2: Byte
+
     // Control messages:
     val Tdrain = 64: Byte
     val Rdrain = -64: Byte
     val Tping = 65: Byte
-    val Rping = -63: Byte
+    val Rping = -65: Byte
 
-    val Tdiscarded = -62: Byte
+    val Tdiscarded = 66: Byte
+    val Tlease = 67: Byte
 
-    // Could be either:
-    val Rerr = 127: Byte
+    val Rerr = -128: Byte
+
+    // Old implementation flukes.
+    val BAD_Tdiscarded = -62: Byte
+    val BAD_Rerr = 127: Byte
   }
 
   val MarkerTag = 0
   val MinTag = 1
   val MaxTag = (1<<23)-1
+  val TagMSB = (1<<23)
+
+  private def mkByte(b: Byte) =
+    ChannelBuffers.unmodifiableBuffer(ChannelBuffers.wrappedBuffer(Array(b)))
 
   private val bufOfChar = Array[ChannelBuffer](
-    ChannelBuffers.unmodifiableBuffer(ChannelBuffers.wrappedBuffer(Array[Byte](0))),
-    ChannelBuffers.unmodifiableBuffer(ChannelBuffers.wrappedBuffer(Array[Byte](1))),
-    ChannelBuffers.unmodifiableBuffer(ChannelBuffers.wrappedBuffer(Array[Byte](2))))
+    mkByte(0), mkByte(1), mkByte(2))
 
-  abstract class EmptyMessage(val typ: Byte) extends Message {
-    val buf = ChannelBuffers.EMPTY_BUFFER
+  abstract class EmptyMessage extends Message {
+    def buf = ChannelBuffers.EMPTY_BUFFER
   }
-  abstract class MarkerMessage(val typ: Byte) extends Message {
-    val tag = 0
+  abstract class MarkerMessage extends Message {
+    def tag = 0
   }
 
   object Treq {
@@ -56,15 +130,16 @@ private object Message {
     }
   }
 
+  /** A transmit request message */
   case class Treq(tag: Int, traceId: Option[TraceId], req: ChannelBuffer) extends Message {
     import Treq._
-    val typ = Types.Treq
+    def typ = Types.Treq
     lazy val buf = {
       val header = traceId match {
         // Currently we require the 3-tuple, but this is not
         // necessarily required.
         case Some(traceId) =>
-          val hd = ChannelBuffers.directBuffer(1+1+1+24+1+1+1)
+          val hd = ChannelBuffers.buffer(1+1+1+24+1+1+1)
           hd.writeByte(2) // 2 entries
 
           hd.writeByte(Keys.TraceId) // key 0 (traceid)
@@ -87,8 +162,9 @@ private object Message {
     }
   }
 
+  /** A reply to a `Treq` message */
   abstract class Rreq(rreqType: Byte, body: ChannelBuffer) extends Message {
-    val typ = Types.Rreq
+    def typ = Types.Rreq
     lazy val buf = ChannelBuffers.wrappedBuffer(bufOfChar(rreqType), body)
   }
 
@@ -96,20 +172,194 @@ private object Message {
   case class RreqError(tag: Int, error: String) extends Rreq(1, encodeString(error))
   case class RreqNack(tag: Int) extends Rreq(2, ChannelBuffers.EMPTY_BUFFER)
 
-  case class Tdrain(tag: Int) extends EmptyMessage(Types.Tdrain)
-  case class Rdrain(tag: Int) extends EmptyMessage(Types.Rdrain)
-  case class Tping(tag: Int) extends EmptyMessage(Types.Tping)
-  case class Rping(tag: Int) extends EmptyMessage(Types.Rping)
+  private[this] val noBytes = Array.empty[Byte]
+
+  case class Tdispatch(
+      tag: Int,
+      contexts: Seq[(ChannelBuffer, ChannelBuffer)],
+      dst: Path,
+      dtab: Dtab,
+      req: ChannelBuffer)
+    extends Message {
+    def typ = Types.Tdispatch
+    lazy val buf = {
+      // first, compute how large the message header is (in 'n')
+      var n = 2
+      var seq = contexts
+      while (seq.nonEmpty) {
+        // Note: here and below we don't use the scala dereferencing sugar of
+        // `val (k, v) = seq.head` as that caused unnecessary Tuple2 allocations.
+        seq.head match { case (k, v) =>
+          n += 2 + k.readableBytes + 2 + v.readableBytes
+        }
+        seq = seq.tail
+      }
+
+      val dstbytes = if (dst.isEmpty) noBytes else dst.show.getBytes(Charsets.Utf8)
+      n += 2 + dstbytes.length
+      n += 2
+
+      val dtabbytes = new Array[(Array[Byte], Array[Byte])](dtab.size)
+      var dtabidx = 0
+      var i = 0
+      while (i < dtab.length) {
+        val dentry = dtab(i)
+        val srcbytes = dentry.prefix.show.getBytes(Charsets.Utf8)
+        val treebytes = dentry.dst.show.getBytes(Charsets.Utf8)
+
+        n += srcbytes.length + 2 + treebytes.length + 2
+
+        dtabbytes(dtabidx) = (srcbytes, treebytes)
+        dtabidx += 1
+        i += 1
+      }
+
+      // then, allocate and populate the header
+      val hd = ChannelBuffers.dynamicBuffer(n)
+      hd.writeShort(contexts.length)
+      seq = contexts
+      while (seq.nonEmpty) {
+        // TODO: it may or may not make sense
+        // to do zero-copy here.
+        seq.head match { case (k, v) =>
+          hd.writeShort(k.readableBytes)
+          hd.writeBytes(k.slice())
+          hd.writeShort(v.readableBytes)
+          hd.writeBytes(v.slice())
+        }
+        seq = seq.tail
+      }
+
+      hd.writeShort(dstbytes.length)
+      hd.writeBytes(dstbytes)
+
+      hd.writeShort(dtab.size)
+      dtabidx = 0
+      while (dtabidx != dtabbytes.length) {
+        dtabbytes(dtabidx) match { case (srcbytes, treebytes) =>
+          hd.writeShort(srcbytes.length)
+          hd.writeBytes(srcbytes)
+          hd.writeShort(treebytes.length)
+          hd.writeBytes(treebytes)
+        }
+        dtabidx += 1
+      }
+
+      ChannelBuffers.wrappedBuffer(hd, req)
+    }
+  }
+
+  /** A reply to a `Tdispatch` message */
+  abstract class Rdispatch(
+      status: Byte,
+      contexts: Seq[(ChannelBuffer, ChannelBuffer)],
+      body: ChannelBuffer
+  ) extends Message {
+    def typ = Types.Rdispatch
+    lazy val buf = {
+      var n = 1+2
+      var seq = contexts
+      while (seq.nonEmpty) {
+        seq.head match { case (k, v) =>
+          n += 2+k.readableBytes+2+v.readableBytes
+        }
+        seq = seq.tail
+      }
+
+      val hd = ChannelBuffers.buffer(n)
+      hd.writeByte(status)
+      hd.writeShort(contexts.length)
+      seq = contexts
+      while (seq.nonEmpty) {
+        seq.head match { case (k, v) =>
+          hd.writeShort(k.readableBytes)
+          hd.writeBytes(k.slice())
+          hd.writeShort(v.readableBytes)
+          hd.writeBytes(v.slice())
+        }
+        seq = seq.tail
+      }
+
+      ChannelBuffers.wrappedBuffer(hd, body)
+    }
+  }
+
+  case class RdispatchOk(
+      tag: Int,
+      contexts: Seq[(ChannelBuffer, ChannelBuffer)],
+      reply: ChannelBuffer
+  ) extends Rdispatch(0, contexts, reply)
+
+  case class RdispatchError(
+      tag: Int,
+      contexts: Seq[(ChannelBuffer, ChannelBuffer)],
+      error: String
+  ) extends Rdispatch(1, contexts, encodeString(error))
+
+  case class RdispatchNack(
+      tag: Int,
+      contexts: Seq[(ChannelBuffer, ChannelBuffer)]
+  ) extends Rdispatch(2, contexts, ChannelBuffers.EMPTY_BUFFER)
+
+  /** Indicates to the client to stop sending new requests. */
+  case class Tdrain(tag: Int) extends EmptyMessage { def typ = Types.Tdrain }
+
+  /** Response from the client to a `Tdrain` message */
+  case class Rdrain(tag: Int) extends EmptyMessage { def typ = Types.Rdrain }
+
+  /** Used to check liveness */
+  case class Tping(tag: Int) extends EmptyMessage { def typ = Types.Tping }
+
+  /** Response to a `Tping` message */
+  case class Rping(tag: Int) extends EmptyMessage { def typ = Types.Rping }
+
+  /** Indicates that the corresponding T message produced an error. */
   case class Rerr(tag: Int, error: String) extends Message {
-    val typ = Types.Rerr
+    // Use the old Rerr type in a transition period so that we
+    // can be reasonably sure we remain backwards compatible with
+    // old servers.
+
+    def typ = Types.BAD_Rerr
     lazy val buf = encodeString(error)
   }
 
-  case class Tdiscarded(which: Int, why: String) extends MarkerMessage(Types.Tdiscarded) {
+  /**
+   * Indicates that the `Treq` with the tag indicated by `which` has been discarded
+   * by the client.
+   */
+  case class Tdiscarded(which: Int, why: String)
+      // Use the old Tdiscarded type in a transition period so that we
+      // can be reasonably sure we remain backwards compatible with
+      // old servers.
+      extends MarkerMessage {
+    def typ = Types.BAD_Tdiscarded
     lazy val buf = ChannelBuffers.wrappedBuffer(
       ChannelBuffers.wrappedBuffer(
         Array[Byte]((which>>16 & 0xff).toByte, (which>>8 & 0xff).toByte, (which & 0xff).toByte)),
       encodeString(why))
+  }
+
+  object Tlease {
+    val MinLease = Duration.Zero
+    val MaxLease = Duration.fromMilliseconds((1L << 32) - 1) // Unsigned Int max value
+
+    val MillisDuration: Byte = 0
+
+    def apply(howLong: Duration): Tlease = {
+      require(howLong >= MinLease && howLong <= MaxLease, "lease out of range")
+      Tlease(MillisDuration, howLong.inMilliseconds)
+    }
+    def apply(end: Time): Tlease = Tlease(1, end.sinceEpoch.inMilliseconds)
+  }
+
+  case class Tlease(unit: Byte, howLong: Long) extends MarkerMessage {
+    def typ = Types.Tlease
+    lazy val buf = {
+      val b = ChannelBuffers.buffer(9)
+      b.writeByte(unit)
+      b.writeLong(howLong)
+      b
+    }
   }
 
   object Tmessage {
@@ -124,15 +374,26 @@ private object Message {
       else None
   }
 
-  def decodeString(buf: ChannelBuffer) = {
-    val n = buf.readableBytes
+  object ControlMessage {
+    // TODO: Update this extractor in the event that we "fix" the control
+    // message flukes by removing backwards compatibility.
+    def unapply(m: Message): Option[Int] =
+      if (math.abs(m.typ) >= 64 || m.typ == Types.BAD_Tdiscarded)
+        Some(m.tag)
+      else None
+  }
+
+  def decodeUtf8(buf: ChannelBuffer): String =
+    decodeUtf8(buf, buf.readableBytes)
+
+  def decodeUtf8(buf: ChannelBuffer, n: Int): String = {
     val arr = new Array[Byte](n)
     buf.readBytes(arr)
-    new String(arr, CharsetUtil.UTF_8)
+    new String(arr, Charsets.Utf8)
   }
 
   def encodeString(str: String) =
-    ChannelBuffers.wrappedBuffer(str.getBytes(CharsetUtil.UTF_8))
+    ChannelBuffers.wrappedBuffer(str.getBytes(Charsets.Utf8))
 
   private def decodeTreq(tag: Int, buf: ChannelBuffer) = {
     if (buf.readableBytes < 1)
@@ -186,19 +447,75 @@ private object Message {
       nkeys -= 1
     }
 
-    val id = trace3 map { case (spanId, parentId, traceId) =>
-      TraceId(Some(traceId), Some(parentId), spanId, None, Flags(traceFlags))
+    val id = trace3 match {
+      case Some((spanId, parentId, traceId)) =>
+        Some(TraceId(Some(traceId), Some(parentId), spanId, None, Flags(traceFlags)))
+      case None => None
     }
 
-    Treq(tag, id, buf.duplicate())
+    Treq(tag, id, buf.slice())
+  }
+
+  private def decodeContexts(buf: ChannelBuffer): Seq[(ChannelBuffer, ChannelBuffer)] = {
+    val n = buf.readUnsignedShort()
+    if (n == 0)
+      return Nil
+
+    val contexts = new Array[(ChannelBuffer, ChannelBuffer)](n)
+    var i = 0
+    while (i < n) {
+      val nk = buf.readUnsignedShort()
+      val k = buf.readSlice(nk)
+      val nv = buf.readUnsignedShort()
+      val v = buf.readSlice(nv)
+      contexts(i) = (k, v)
+      i += 1
+    }
+    contexts
+  }
+
+  private def decodeTdispatch(tag: Int, buf: ChannelBuffer) = {
+    val contexts = decodeContexts(buf)
+
+    val ndst = buf.readUnsignedShort()
+    // Path.read("") fails, so special case empty-dst.
+    val dst =
+      if (ndst == 0) Path.empty
+      else Path.read(decodeUtf8(buf.readSlice(ndst)))
+
+    val nd = buf.readUnsignedShort()
+    val dtab = if (nd == 0) Dtab.empty else {
+      var i = 0
+      val delegations = new Array[Dentry](nd)
+      while (i < nd) {
+        val src = decodeUtf8(buf, buf.readUnsignedShort())
+        val dst = decodeUtf8(buf, buf.readUnsignedShort())
+        delegations(i) = Dentry(Path.read(src), NameTree.read(dst))
+        i += 1
+      }
+      Dtab(delegations)
+    }
+
+    Tdispatch(tag, contexts, dst, dtab, buf.slice())
+  }
+
+  private def decodeRdispatch(tag: Int, buf: ChannelBuffer) = {
+    val status = buf.readByte()
+    val contexts = decodeContexts(buf)
+    status match {
+      case 0 => RdispatchOk(tag, contexts, buf.slice())
+      case 1 => RdispatchError(tag, contexts, decodeUtf8(buf))
+      case 2 => RdispatchNack(tag, contexts)
+      case _ => throw BadMessageException("invalid Rdispatch status")
+    }
   }
 
   private def decodeRreq(tag: Int, buf: ChannelBuffer) = {
     if (buf.readableBytes < 1)
       throw BadMessageException("short Rreq")
     buf.readByte() match {
-      case 0 => RreqOk(tag, buf.duplicate())
-      case 1 => RreqError(tag, decodeString(buf))
+      case 0 => RreqOk(tag, buf.slice())
+      case 1 => RreqError(tag, decodeUtf8(buf))
       case 2 => RreqNack(tag)
       case _ => throw BadMessageException("invalid Rreq status")
     }
@@ -208,31 +525,41 @@ private object Message {
     if (buf.readableBytes < 3)
       throw BadMessageException("short Tdiscarded message")
     val which = ((buf.readByte() & 0xff)<<16) | ((buf.readByte() & 0xff)<<8) | (buf.readByte() & 0xff)
-    Tdiscarded(which, decodeString(buf))
+    Tdiscarded(which, decodeUtf8(buf))
+  }
+
+  private def decodeTlease(buf: ChannelBuffer) = {
+    if (buf.readableBytes < 9)
+      throw BadMessageException("short Tlease message")
+    val unit: Byte = buf.readByte()
+    val howMuch: Long = buf.readLong()
+    Tlease(unit, howMuch)
   }
 
   def decode(buf: ChannelBuffer): Message = {
     if (buf.readableBytes < 4)
       throw BadMessageException("short message")
     val head = buf.readInt()
-    val typ = (head>>24 & 0xff).toByte
+    def typ = (head>>24 & 0xff).toByte
     val tag = head & 0x00ffffff
     typ match {
       case Types.Treq => decodeTreq(tag, buf)
       case Types.Rreq => decodeRreq(tag, buf)
+      case Types.Tdispatch => decodeTdispatch(tag, buf)
+      case Types.Rdispatch => decodeRdispatch(tag, buf)
       case Types.Tdrain => Tdrain(tag)
       case Types.Rdrain => Rdrain(tag)
       case Types.Tping => Tping(tag)
       case Types.Rping => Rping(tag)
-      case Types.Rerr => Rerr(tag, decodeString(buf))
-      case Types.Tdiscarded => decodeTdiscarded(buf)
+      case Types.Rerr | Types.BAD_Rerr => Rerr(tag, decodeUtf8(buf))
+      case Types.Tdiscarded | Types.BAD_Tdiscarded => decodeTdiscarded(buf)
+      case Types.Tlease => decodeTlease(buf)
       case bad => throw BadMessageException("bad message type: %d [tag=%d]".format(bad, tag))
     }
   }
 
   def encode(m: Message): ChannelBuffer = {
-    if (m.tag < MarkerTag || m.tag > MaxTag || (m.tag == MarkerTag
-        && !m.isInstanceOf[MarkerMessage]))
+    if (m.tag < MarkerTag || (m.tag & ~TagMSB) > MaxTag)
       throw new BadMessageException("invalid tag number %d".format(m.tag))
 
     val head = Array[Byte](

@@ -4,6 +4,15 @@ import com.twitter.finagle.util.AsyncLatch
 import com.twitter.finagle.{Service, ServiceFactory, ClientConnection}
 import com.twitter.util.{Future, Promise, Time}
 
+/**
+ * A [[com.twitter.finagle.ServiceFactory]] that produces
+ * [[com.twitter.finagle.Service Services]] identical to the argument `service`.
+ *
+ * Note that this factory builds new [[com.twitter.finagle.Service Services]],
+ * so the "singleton" `service` argument is not shared by reference. This
+ * differs from [[com.twitter.finagle.ServiceFactory#const]] in that `const`
+ * proxies all requests to the same `service` rather than creating new objects.
+ */
 class SingletonFactory[Req, Rep](service: Service[Req, Rep])
   extends ServiceFactory[Req, Rep]
 {
@@ -19,14 +28,14 @@ class SingletonFactory[Req, Rep](service: Service[Req, Rep])
 
   def close(deadline: Time) = {
     val p = new Promise[Unit]
-    latch.await { 
+    latch.await {
       service.close()
-      p.setValue(())
+      p.setDone()
     }
     p
   }
 
-  override def isAvailable = service.isAvailable
+  override def status = service.status
 
   override val toString = "singleton_factory_%s".format(service.toString)
 }

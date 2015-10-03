@@ -8,8 +8,10 @@ import com.twitter.util.Future
 import org.apache.thrift.protocol.TBinaryProtocol
 
 import com.twitter.finagle.builder.{ClientBuilder, ServerBuilder}
+import com.twitter.finagle.demo.thriftscala._
 import com.twitter.finagle.thrift.{ThriftServerFramedCodec, ThriftClientFramedCodec}
 import com.twitter.finagle.tracing.{Trace, ConsoleTracer}
+
 
 object Tracing1Service extends Tracing1.FutureIface {
   private[this] val transport = ClientBuilder()
@@ -101,14 +103,14 @@ object Client {
 
     val client = new Tracing1.FinagledClient(
       transport, new TBinaryProtocol.Factory())
-
-    Trace.pushTracer(ConsoleTracer)
-    Trace.record("about to start issuing the root request..")
-
-    println("& my trace id is %s".format(Trace.id))
-    val result = client.computeSomething()
-    result foreach { result =>
-      println("result", result)
+    
+    Trace.letTracer(ConsoleTracer) {
+      Trace.record("about to start issuing the root request..")
+      println("& my trace id is %s".format(Trace.id))
+      val result = client.computeSomething()
+      result foreach { result =>
+        println("result", result)
+      }
     }
   }
 }

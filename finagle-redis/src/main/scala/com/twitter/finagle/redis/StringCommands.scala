@@ -5,13 +5,13 @@ import com.twitter.finagle.redis.protocol._
 import com.twitter.util.Future
 import org.jboss.netty.buffer.ChannelBuffer
 
-
 trait Strings { self: BaseClient =>
 
   /**
    * Appends value at the given key. If key doesn't exist,
    * behavior is similar to SET command
-   * @params key, value
+   * @param key
+   * @param value
    * @return length of string after append operation
    */
   def append(key: ChannelBuffer, value: ChannelBuffer): Future[JLong] =
@@ -64,7 +64,8 @@ trait Strings { self: BaseClient =>
   /**
    * Decrements number stored at key by given amount. If key doesn't
    * exist, value is set to 0 before the operation
-   * @params key, amount
+   * @param key
+   * @param amount
    * @return value after decrement. Error if key contains value
    * of the wrong type
    */
@@ -98,7 +99,9 @@ trait Strings { self: BaseClient =>
 
   /**
    * Gets the substring of the value associated with given key
-   * @params key, start, end
+   * @param key
+   * @param start
+   * @param end
    * @return substring, or none if key doesn't exist
    */
   def getRange(key: ChannelBuffer, start: Long, end: Long): Future[Option[ChannelBuffer]] =
@@ -156,13 +159,13 @@ trait Strings { self: BaseClient =>
   def mGet(keys: Seq[ChannelBuffer]): Future[Seq[Option[ChannelBuffer]]] =
     doRequest(MGet(keys)) {
       case MBulkReply(messages) => Future {
-        messages map {
+        messages.map {
           case BulkReply(message) => Some(message)
           case EmptyBulkReply()   => None
           case _ => throw new IllegalStateException()
-        } toSeq
+        }.toSeq
       }
-      case EmptyMBulkReply()    => Future.value(Seq.empty)
+      case EmptyMBulkReply()    => Future.Nil
     }
 
   /**
@@ -205,7 +208,8 @@ trait Strings { self: BaseClient =>
   /**
    * Sets the given value to key. If a value already exists for the key,
    * the value is overwritten with the new value
-   * @params key, value
+   * @param key
+   * @param value
    */
   def set(key: ChannelBuffer, value: ChannelBuffer): Future[Unit] =
     doRequest(Set(key, value)) {
@@ -237,6 +241,34 @@ trait Strings { self: BaseClient =>
     }
 
   /**
+   * Set key to hold the string value with the specified expire time in seconds
+   * only if the key does not already exist.
+   *
+   * @param key, millis, value
+   * @return true if the key was set, false if condition was not met.
+   * @see http://redis.io.commands/set
+   */
+  def setExNx(key: ChannelBuffer, seconds: Long, value: ChannelBuffer): Future[JBoolean] =
+    doRequest(Set(key, value, Some(InSeconds(seconds)), true, false)) {
+      case StatusReply(_) => Future.value(true)
+      case EmptyBulkReply() => Future.value(false)
+    }
+
+  /**
+   * Set key to hold the string value with the specified expire time in seconds
+   * only if the key already exist.
+   *
+   * @param key, millis, value
+   * @return true if the key was set, false if condition was not met.
+   * @see http://redis.io.commands/set
+   */
+  def setExXx(key: ChannelBuffer, seconds: Long, value: ChannelBuffer): Future[JBoolean] =
+    doRequest(Set(key, value, Some(InSeconds(seconds)), false, true)) {
+      case StatusReply(_) => Future.value(true)
+      case EmptyBulkReply() => Future.value(false)
+    }
+
+  /**
    * Set key to hold string value if key does not exist. In that case, it is
    * equal to SET. When key already holds a value, no operation is performed.
    *
@@ -247,6 +279,58 @@ trait Strings { self: BaseClient =>
   def setNx(key: ChannelBuffer, value: ChannelBuffer): Future[JBoolean] =
     doRequest(SetNx(key, value)) {
       case IntegerReply(n) => Future.value(n == 1)
+    }
+
+  /**
+   * Set key to hold the string value with the specified expire time in milliseconds.
+   *
+   * @param key, millis, value
+   * @see http://redis.io.commands/set
+   */
+  def setPx(key: ChannelBuffer, millis: Long, value: ChannelBuffer): Future[Unit] =
+    doRequest(Set(key, value, Some(InMilliseconds(millis)))) {
+      case StatusReply(_) => Future.Unit
+    }
+
+  /**
+   * Set key to hold the string value with the specified expire time in milliseconds
+   * only if the key does not already exist.
+   *
+   * @param key, millis, value
+   * @return true if the key was set, false if condition was not met.
+   * @see http://redis.io.commands/set
+   */
+  def setPxNx(key: ChannelBuffer, millis: Long, value: ChannelBuffer): Future[JBoolean] =
+    doRequest(Set(key, value, Some(InMilliseconds(millis)), true, false)) {
+      case StatusReply(_) => Future.value(true)
+      case EmptyBulkReply() => Future.value(false)
+    }
+
+  /**
+   * Set key to hold the string value with the specified expire time in milliseconds
+   * only if the key already exist.
+   *
+   * @param key, millis, value
+   * @return true if the key was set, false if condition was not met.
+   * @see http://redis.io.commands/set
+   */
+  def setPxXx(key: ChannelBuffer, millis: Long, value: ChannelBuffer): Future[JBoolean] =
+    doRequest(Set(key, value, Some(InMilliseconds(millis)), false, true)) {
+      case StatusReply(_) => Future.value(true)
+      case EmptyBulkReply() => Future.value(false)
+    }
+
+  /**
+   * Set key to hold the string value only if the key already exist.
+   *
+   * @param key, value
+   * @return true if the key was set, false if condition was not met.
+   * @see http://redis.io.commands/set
+   */
+  def setXx(key: ChannelBuffer, value: ChannelBuffer): Future[JBoolean] =
+    doRequest(Set(key, value, None, false, true)) {
+      case StatusReply(_) => Future.value(true)
+      case EmptyBulkReply() => Future.value(false)
     }
 
   /**

@@ -1,16 +1,28 @@
 package com.twitter.finagle.zipkin.thrift
 
 import com.twitter.finagle.tracing.{Record, TraceId}
+import scala.util.Random
 
 object Sampler {
   // Default is 0.001 = 0.1% (let one in a 1000nd pass)
   val DefaultSampleRate = 0.001f
+
+  /**
+   * This salt is used to prevent traceId collisions between machines.
+   * By giving each system a random salt, it is less likely that two
+   * processes will sample the same subset of trace ids.
+   */
+  private val salt = new Random().nextLong()
+
+  private val SomeTrue = Some(true)
+  private val SomeFalse = Some(false)
 }
 
 /**
  * Decide if we should sample a particular trace or not.
  */
 class Sampler {
+  @volatile
   private[this] var sr = Sampler.DefaultSampleRate
 
   /**
@@ -51,7 +63,15 @@ class Sampler {
    * @param sampleRate don't use the sampler's sample rate, instead use this one directly
    */
   def sampleTrace(traceId: TraceId, sampleRate: Float): Option[Boolean] = {
-    Some(math.abs(traceId.traceId.toLong) % 10000 < sampleRate * 10000)
+    traceId.sampled match {
+      case None =>
+        if (math.abs(traceId.traceId.toLong^Sampler.salt)%10000 < sampleRate*10000)
+          Sampler.SomeTrue
+        else
+          Sampler.SomeFalse
+      case sample @ Some(_) =>
+        sample
+    }
   }
 
   /**
@@ -61,6 +81,9 @@ class Sampler {
    * @return true if we should keep it, false for throw away
    */
   def sampleRecord(record: Record): Boolean = {
-    record.traceId.sampled.getOrElse(sampleTrace(record.traceId).get)
+    sampleTrace(record.traceId) match {
+      case Some(sampled) => sampled
+      case None          => false
+    }
   }
 }

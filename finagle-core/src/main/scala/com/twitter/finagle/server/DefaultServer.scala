@@ -1,28 +1,18 @@
 package com.twitter.finagle.server
 
 import com.twitter.concurrent.AsyncSemaphore
-import com.twitter.finagle._
-import com.twitter.finagle.builder.SourceTrackingMonitor
-import com.twitter.finagle.filter.{
-  HandletimeFilter, MaskCancelFilter, MkJvmFilter, MonitorFilter, RequestSemaphoreFilter
-}
-import com.twitter.finagle.service.{TimeoutFilter, StatsFilter}
-import com.twitter.finagle.stats.{StatsReceiver, NullStatsReceiver, DefaultStatsReceiver}
-import com.twitter.finagle.tracing.{Tracer, TracingFilter, DefaultTracer}
+import com.twitter.finagle.filter.{MaskCancelFilter, RequestSemaphoreFilter}
+import com.twitter.finagle.service.TimeoutFilter
+import com.twitter.finagle.stats.{StatsReceiver, ServerStatsReceiver}
+import com.twitter.finagle.tracing._
 import com.twitter.finagle.transport.Transport
-import com.twitter.finagle.util.{DefaultMonitor, DefaultTimer, DefaultLogger}
-import com.twitter.jvm.Jvm
-import com.twitter.util.{Duration, Monitor, Timer, Closable, Return, Throw, Time}
+import com.twitter.finagle.util.{DefaultMonitor, DefaultTimer, DefaultLogger, ReporterFactory, LoadedReporterFactory}
+import com.twitter.finagle.{param, Stack, Stackable}
+import com.twitter.finagle.{Server, Service, ServiceFactory, ListeningServer}
+import com.twitter.util.{Closable, Duration, Future, Monitor, Timer}
 import java.net.SocketAddress
-import java.util.Collections
-import java.util.concurrent.ConcurrentHashMap
-import scala.collection.JavaConverters._
 
-object DefaultServer {
-  private val newJvmFilter = new MkJvmFilter(Jvm())
-}
-
-/*
+/**
  * The default Server implementation. It is given a Listener (eg.
  * [[com.twitter.finagle.netty3.Netty3Listener]]) and a function,
  * serveTransport, that binds a transport and a service. It will then
@@ -43,9 +33,8 @@ object DefaultServer {
  * @param maxConcurrentRequests The maximum number of concurrent
  * requests the server is willing to handle.
  *
- * @param cancelOnHangup The maximum amount of time the server is
- * allowed to handle a request. If the timeout expires, the server
- * will cancel the future and terminate the client connection.
+ * @param cancelOnHangup Enabled by default. If disabled,
+ * exceptions on the transport do not propagate to the transport.
  *
  * @param prepare Prepare the given `ServiceFactory` before use.
  */
@@ -56,113 +45,58 @@ case class DefaultServer[Req, Rep, In, Out](
   requestTimeout: Duration = Duration.Top,
   maxConcurrentRequests: Int = Int.MaxValue,
   cancelOnHangup: Boolean = true,
-  prepare: ServiceFactory[Req, Rep] => ServiceFactory[Req, Rep] = (sf: ServiceFactory[Req, Rep]) => sf,
+  prepare: ServiceFactory[Req, Rep] => ServiceFactory[Req, Rep] =
+    (sf: ServiceFactory[Req, Rep]) => sf,
   timer: Timer = DefaultTimer.twitter,
   monitor: Monitor = DefaultMonitor,
   logger: java.util.logging.Logger = DefaultLogger,
-  statsReceiver: StatsReceiver = DefaultStatsReceiver,
-  tracer: Tracer = DefaultTracer
+  statsReceiver: StatsReceiver = ServerStatsReceiver,
+  tracer: Tracer = DefaultTracer,
+  reporter: ReporterFactory = LoadedReporterFactory,
+  newTraceInitializer: Stackable[ServiceFactory[Req, Rep]] = TraceInitializerFilter.serverModule[Req, Rep]
 ) extends Server[Req, Rep] {
-  private[this] val connections = Collections.newSetFromMap(
-    new ConcurrentHashMap[Closable, java.lang.Boolean])
 
-  protected val outer: Transformer[Req, Rep] = {
-    val handletimeFilter = new HandletimeFilter[Req, Rep](statsReceiver)
-    val monitorFilter = new MonitorFilter[Req, Rep](
-      monitor andThen new SourceTrackingMonitor(logger, "server"))
-    val tracingFilter = new TracingFilter[Req, Rep](tracer)
-    val jvmFilter= DefaultServer.newJvmFilter[Req, Rep]()
+  val stack = StackServer.newStack[Req, Rep]
+    .replace(StackServer.Role.preparer, prepare)
+    .replace(TraceInitializerFilter.role, newTraceInitializer)
 
-    val filter = handletimeFilter andThen // to measure total handle time
-      monitorFilter andThen // to maximize surface area for exception handling
-      tracingFilter andThen // to prepare tracing prior to codec tracing support
-      jvmFilter  // to maximize surface area
+  private type _In = In
+  private type _Out = Out
 
-    filter andThen _
+  private case class Server(
+    stack: Stack[ServiceFactory[Req, Rep]] = stack,
+    params: Stack.Params = Stack.Params.empty
+  ) extends StdStackServer[Req, Rep, Server] {
+    protected def copy1(
+      stack: Stack[ServiceFactory[Req, Rep]] = this.stack,
+      params: Stack.Params = this.params
+    ) = copy(stack, params)
+
+    protected type In = _In
+    protected type Out = _Out
+    protected def newListener() = listener
+    protected def newDispatcher(transport: Transport[In, Out], service: Service[Req, Rep]) =
+      serviceTransport(transport, service)
   }
 
-  protected val inner: Transformer[Req, Rep] = {
-    val maskCancelFilter: SimpleFilter[Req, Rep] =
-      if (cancelOnHangup) Filter.identity
-      else new MaskCancelFilter
+  val underlying: StackServer[Req, Rep] = Server()
 
-    val statsFilter: SimpleFilter[Req, Rep] =
-      if (statsReceiver ne NullStatsReceiver) new StatsFilter(statsReceiver)
-      else Filter.identity
+  private[this] val sem =
+    if (maxConcurrentRequests == Int.MaxValue) None
+    else Some(new AsyncSemaphore(maxConcurrentRequests, 0))
 
-    val timeoutFilter: SimpleFilter[Req, Rep] =
-      if (requestTimeout < Duration.Top) {
-        val exc = new IndividualRequestTimeoutException(requestTimeout)
-        new TimeoutFilter(requestTimeout, exc, timer)
-      } else Filter.identity
+  val configured = underlying
+    .configured(param.Label(name))
+    .configured(param.Timer(timer))
+    .configured(param.Monitor(monitor))
+    .configured(param.Logger(logger))
+    .configured(param.Stats(statsReceiver))
+    .configured(param.Tracer(tracer))
+    .configured(param.Reporter(reporter))
+    .configured(MaskCancelFilter.Param(!cancelOnHangup))
+    .configured(TimeoutFilter.Param(requestTimeout))
+    .configured(RequestSemaphoreFilter.Param(sem))
 
-    val requestSemaphoreFilter: SimpleFilter[Req, Rep] =
-      if (maxConcurrentRequests == Int.MaxValue) Filter.identity else {
-        val sem = new AsyncSemaphore(maxConcurrentRequests)
-        new RequestSemaphoreFilter[Req, Rep](sem) {
-          // We capture the gauges inside of here so their
-          // (reference) lifetime is tied to that of the filter
-          // itself.
-          val g0 = statsReceiver.addGauge("request_concurrency") {
-            maxConcurrentRequests - sem.numPermitsAvailable
-          }
-          val g1 = statsReceiver.addGauge("request_queue_size") { sem.numWaiters }
-        }
-      }
-
-    val filter = maskCancelFilter andThen
-      requestSemaphoreFilter andThen
-      statsFilter andThen
-      timeoutFilter
-
-    filter andThen _
-  }
-
-  protected val newStack: Transformer[Req, Rep] =
-    outer compose prepare compose inner
-
-  def serveTransport(serviceFactory: ServiceFactory[Req, Rep], transport: Transport[In, Out]) {
-    val clientConn = new ClientConnection {
-      val remoteAddress = transport.remoteAddress
-      val localAddress = transport.localAddress
-      def close(deadline: Time) = transport.close(deadline)
-      val onClose = transport.onClose.map(_ => ())
-    }
-
-    serviceFactory(clientConn) respond {
-      case Return(service) =>
-        val conn = serviceTransport(transport, service)
-        connections.add(conn)
-        transport.onClose ensure {
-          connections.remove(conn)
-        }
-      case Throw(_) =>
-        transport.close()
-    }
-  }
-  
-  def serveRaw(addr: SocketAddress, factory: ServiceFactory[Req, Rep]): ListeningServer =
-    new ListeningServer {
-      val underlying = listener.listen(addr) { transport => 
-        serveTransport(newStack(factory), transport)
-      }
-      def close(deadline: Time) = {
-        // The order here is important: by calling underlying.close()
-        // first, we guarantee that no further connections are
-        // created.
-        //
-        // TODO: it would be cleaner to fully represent the draining
-        // states: accepting no further connections (requests) then
-        // fully drained, then closed.
-        val closable = Closable.sequence(underlying, Closable.all(connections.asScala.toSeq:_*))
-        connections.clear()
-        closable.close(deadline)
-      }
-
-      def boundAddress = underlying.boundAddress
-    }
-
-  def serve(addr: SocketAddress, factory: ServiceFactory[Req, Rep]): ListeningServer = copy(
-    statsReceiver = statsReceiver.scope(name)
-  ).serveRaw(addr, factory)
+  def serve(addr: SocketAddress, factory: ServiceFactory[Req, Rep]): ListeningServer =
+    configured.serve(addr, factory)
 }

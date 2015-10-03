@@ -1,24 +1,22 @@
 package com.twitter.finagle.stress
 
-import com.twitter.app.App
-import com.twitter.conversions.time._
-import com.twitter.finagle.builder.ClientBuilder
-import com.twitter.finagle.http.Http
-import com.twitter.finagle.Service
-import com.twitter.finagle.stats.OstrichStatsReceiver
-import com.twitter.ostrich.stats.{Stats => OstrichStats}
-import com.twitter.ostrich.stats.StatsCollection
-import com.twitter.util.{Duration, CountDownLatch, Return, Throw, Stopwatch}
-
 import com.google.caliper.{Param, SimpleBenchmark}
+import com.twitter.app.App
+import com.twitter.concurrent.{BridgedThreadPoolScheduler, Scheduler, ThreadPoolScheduler}
+import com.twitter.conversions.time._
+import com.twitter.finagle.Service
+import com.twitter.finagle.builder.ClientBuilder
+import com.twitter.finagle.httpx.{Http, Request, Response}
+import com.twitter.finagle.stats.OstrichStatsReceiver
+import com.twitter.ostrich.stats.{Stats => OstrichStats, StatsCollection}
+import com.twitter.util.{CountDownLatch, Duration, Return, Stopwatch, Throw}
 import java.util.concurrent.atomic.AtomicInteger
-import org.jboss.netty.handler.codec.http._
-
 import scala.collection.mutable.ArrayBuffer
 
 object LoadBalancerTest extends App {
   val nreqsFlag = flag("n", 100000, "Number of reqs sent from each client")
   val latencyFlag = flag("l", 0.seconds, "req latency forced at the server")
+  val schedFlag = flag("sched", "local", "Use the specified scheduler")
 
   val totalRequests = new AtomicInteger(0)
   val clientBuilder = ClientBuilder()
@@ -26,6 +24,19 @@ object LoadBalancerTest extends App {
     .retries(10)
 
   def main() {
+    schedFlag() match {
+      case "local" =>
+      case "threadpool" =>
+        println("Using threadpool scheduler")
+        Scheduler.setUnsafe(new ThreadPoolScheduler("FINAGLE"))
+      case "bridged" =>
+        println("Using the bridged threadpool scheduler")
+        Scheduler.setUnsafe(new BridgedThreadPoolScheduler("FINAGLE"))
+      case unknown =>
+        println("Unknown scheduler "+unknown)
+        System.exit(1)
+    }
+
     runSuite()
   }
 
@@ -137,7 +148,7 @@ class LoadBalancerTest(
   private[this] val gaugeValues   = new ArrayBuffer[(Int, Map[String, Float])]
 
   private[this] def dispatch(
-      client: Service[HttpRequest, HttpResponse],
+      client: Service[Request, Response],
       servers: Seq[EmbeddedServer],
       f: PartialFunction[(Int, Seq[EmbeddedServer]), Unit]) {
     val num = requestNumber.incrementAndGet()
@@ -147,7 +158,7 @@ class LoadBalancerTest(
 
     val elapsed = Stopwatch.start()
 
-    client(new DefaultHttpRequest(HttpVersion.HTTP_1_1, HttpMethod.GET, "/")) respond { result =>
+    client(Request("/")).respond { result =>
       result match {
         case Return(_) =>
           val duration = elapsed()
@@ -177,7 +188,7 @@ class LoadBalancerTest(
 
     val client = clientBuilder
       .codec(Http())
-      .hosts(servers map(_.addr))
+      .hosts(servers map(_.boundAddress))
       .hostConnectionLimit(Int.MaxValue)
       .reportTo(new OstrichStatsReceiver)
       .build()
@@ -217,7 +228,7 @@ class LoadBalancerTest(
 
     servers.zipWithIndex foreach { case (server, which) =>
       server.stop()
-      println("> SERVER[%d] (%s)".format(which, server.addr))
+      println("> SERVER[%d] (%s)".format(which, server.boundAddress))
       Stats.prettyPrint(server.stats)
     }
 

@@ -31,15 +31,28 @@ trait SortedSets { self: BaseClient =>
   }
 
   /**
-   * Adds member, score pair to sorted set
-   * @params key, score, member
+   * Add a member with score to a sorted set
+   * @param key
+   * @param score
+   * @param member
    * @return Number of elements added to sorted set
    */
-  def zAdd(key: ChannelBuffer, score: JDouble, member: ChannelBuffer): Future[JLong] =
-    doRequest(ZAdd(key, Seq(ZMember(score, member)))) {
+  def zAdd(key: ChannelBuffer, score: JDouble, member: ChannelBuffer): Future[JLong] = {
+    zAddMulti(key, Seq((score, member)))
+  }
+
+  /**
+   * Adds member, score pairs to sorted set
+   * @param key
+   * @param members sequence of (score, member) tuples
+   * @return Number of elements added to sorted set
+   * @note Adding multiple elements only works with redis 2.4 or later.
+   */
+  def zAddMulti(key: ChannelBuffer, members: Seq[(JDouble, ChannelBuffer)]): Future[JLong] = {
+    doRequest(ZAdd(key, members.map { m => ZMember(m._1, m._2) })) {
       case IntegerReply(n) => Future.value(n)
     }
-
+  }
   /**
    * Returns sorted set cardinality of the sorted set at key
    * @param key
@@ -53,7 +66,9 @@ trait SortedSets { self: BaseClient =>
 
   /**
    * Gets number of elements in sorted set with score between min and max
-   * @params key, min, max
+   * @param key
+   * @param min
+   * @param max
    * @return Number of elements between min and max in sorted set
    */
   def zCount(key: ChannelBuffer, min: ZInterval, max: ZInterval): Future[JLong] =
@@ -80,7 +95,8 @@ trait SortedSets { self: BaseClient =>
 
   /**
    * Removes specified member(s) from sorted set at key
-   * @params key, member(s)
+   * @param key
+   * @param members
    * @return Number of members removed from sorted set
    */
   def zRem(key: ChannelBuffer, members: Seq[ChannelBuffer]): Future[JLong] =
@@ -136,7 +152,8 @@ trait SortedSets { self: BaseClient =>
 
   /**
    * Gets the rank of member in the sorted set, or None if it doesn't exist, from high to low.
-   * @params key, member
+   * @param key
+   * @param member
    * @return the rank of the member
    */
   def zRevRank(key: ChannelBuffer, member: ChannelBuffer): Future[Option[JLong]] =
@@ -149,7 +166,9 @@ trait SortedSets { self: BaseClient =>
    * Increment the member in sorted set key by amount.
    * Returns an option, None if the member is not found, or the set is empty, or the new value.
    * Throws an exception if the key refers to a structure that is not a sorted set.
-   * @params key, amount, member
+   * @param key
+   * @param amount
+   * @param member
    * @return the new value of the incremented member
    */
   def zIncrBy(key: ChannelBuffer, amount: JDouble, member: ChannelBuffer): Future[Option[JDouble]] =
@@ -161,7 +180,8 @@ trait SortedSets { self: BaseClient =>
 
   /**
    * Gets the rank of the member in the sorted set, or None if it doesn't exist, from low to high.
-   * @params, key, member
+   * @param key
+   * @param member
    * @return the rank of the member
    */
   def zRank(key: ChannelBuffer, member: ChannelBuffer): Future[Option[JLong]] =
@@ -172,7 +192,9 @@ trait SortedSets { self: BaseClient =>
 
   /**
    * Removes members from sorted set by sort order, from start to stop, inclusive.
-   * @params key, start, stop
+   * @param key
+   * @param start
+   * @param stop
    * @return Number of members removed from sorted set.
    */
   def zRemRangeByRank(key: ChannelBuffer, start: JLong, stop: JLong): Future[JLong] =
@@ -182,7 +204,9 @@ trait SortedSets { self: BaseClient =>
 
   /**
    * Removes members from sorted set by score, from min to max, inclusive.
-   * @params key, min, max
+   * @param key
+   * @param min
+   * @param max
    * @return Number of members removed from sorted set.
    */
   def zRemRangeByScore(key: ChannelBuffer, min: ZInterval, max: ZInterval): Future[JLong] =

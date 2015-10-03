@@ -34,8 +34,6 @@ case class IntegerReply(id: Long) extends SingleLineReply {
 }
 
 case class BulkReply(message: ChannelBuffer) extends MultiLineReply {
-  RequireServerProtocol(message.hasArray && message.readableBytes > 0,
-    "BulkReply had empty message")
   override def toChannelBuffer =
     RedisCodec.toUnifiedFormat(List(message), false)
 }
@@ -90,14 +88,8 @@ class ReplyCodec extends UnifiedProtocolCodec {
       case BULK_REPLY =>
         decodeBulkReply
       case MBULK_REPLY =>
-        val doneFn = { lines: List[Reply] =>
-          lines.length match {
-            case empty if empty == 0 => EmptyMBulkReply()
-            case n => MBulkReply(lines)
-          }
-        }
         RequireServerProtocol.safe {
-          readLine { line => decodeMBulkReply(NumberFormat.toLong(line), doneFn) }
+          readLine { line => decodeMBulkReply(NumberFormat.toLong(line)) }
         }
       case b: Byte =>
         throw new ServerError("Unknown response format(%c) found".format(b.asInstanceOf[Char]))
@@ -108,7 +100,7 @@ class ReplyCodec extends UnifiedProtocolCodec {
     RequireServerProtocol.safe {
       NumberFormat.toInt(line)
     } match {
-      case empty if empty < 1 => emit(EmptyBulkReply())
+      case empty if empty < 0 => emit(EmptyBulkReply())
       case replySz => readBytes(replySz) { bytes =>
         readBytes(2) { eol =>
           if (eol(0) != '\r' || eol(1) != '\n') {
@@ -120,49 +112,50 @@ class ReplyCodec extends UnifiedProtocolCodec {
     }
   }
 
-  def decodeMBulkReply[T <: AnyRef](argCount: Long, doneFn: List[Reply] => T) =
-    argCount match {
-      case n if n < 0 => emit(NilMBulkReply())
-      case n => decodeMBulkLines(n, Nil, { lines => doneFn(lines) } )
-    }
+  def decodeMBulkReply(argCount: Long) =
+    decodeMBulkLines(argCount, Nil, Nil)
 
-  def decodeMBulkLines[T <: AnyRef](
-    i: Long,
-    lines: List[Reply],
-    doneFn: List[Reply] => T): NextStep =
-  {
+  def decodeMBulkLines(i: Long, stack: List[(Long, List[Reply])], lines: List[Reply]): NextStep = {
     if (i <= 0) {
-      emit(doneFn(lines.reverse))
+      val reply = (i, lines) match {
+        case (i, _) if i < 0 => NilMBulkReply()
+        case (0, Nil) => EmptyMBulkReply()
+        case (0, lines) => MBulkReply(lines.reverse)
+      }
+      stack match {
+        case Nil => emit(reply)
+        case (i, lines) :: stack => decodeMBulkLines(i, stack, reply :: lines)
+      }
     } else {
       readLine { line =>
         val header = line(0)
         header match {
           case ARG_SIZE_MARKER =>
             val size = NumberFormat.toInt(line.drop(1))
-            if (size < 1) {
-              decodeMBulkLines(i - 1, EmptyBulkReply() :: lines, doneFn)
+            if (size < 0) {
+              decodeMBulkLines(i - 1, stack, EmptyBulkReply() :: lines)
             } else {
               readBytes(size) { byteArray =>
                 readBytes(2) { eol =>
                   if (eol(0) != '\r' || eol(1) != '\n') {
                     throw new ProtocolError("Expected EOL after line data and didn't find it")
                   }
-                  decodeMBulkLines(i - 1,
-                    BulkReply(ChannelBuffers.wrappedBuffer(byteArray)) :: lines, doneFn)
+                  decodeMBulkLines(i - 1, stack,
+                    BulkReply(ChannelBuffers.wrappedBuffer(byteArray)) :: lines)
                 }
               }
             }
           case STATUS_REPLY =>
-            decodeMBulkLines(i - 1, StatusReply(BytesToString(
-              line.drop(1).getBytes)) :: lines, doneFn)
+            decodeMBulkLines(i - 1, stack, StatusReply(BytesToString(
+              line.drop(1).getBytes)) :: lines)
           case ARG_COUNT_MARKER =>
-            decodeMBulkLines(line.drop(1).toLong, lines, doneFn)
+            decodeMBulkLines(line.drop(1).toLong, (i - 1, lines) :: stack, Nil)
           case INTEGER_REPLY =>
-            decodeMBulkLines(i - 1, IntegerReply(NumberFormat.toLong(
-              BytesToString(line.drop(1).getBytes))) :: lines, doneFn)
+            decodeMBulkLines(i - 1, stack, IntegerReply(NumberFormat.toLong(
+              BytesToString(line.drop(1).getBytes))) :: lines)
           case ERROR_REPLY =>
-            decodeMBulkLines(i - 1, ErrorReply(BytesToString(
-              line.drop(1).getBytes)) :: lines, doneFn)
+            decodeMBulkLines(i - 1, stack, ErrorReply(BytesToString(
+              line.drop(1).getBytes)) :: lines)
           case b: Char =>
             throw new ProtocolError("Expected size marker $, got " + b)
         }

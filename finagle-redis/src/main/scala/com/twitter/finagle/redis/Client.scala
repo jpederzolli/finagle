@@ -4,7 +4,7 @@ import com.twitter.finagle.builder.ClientBuilder
 import com.twitter.finagle.redis.protocol._
 import com.twitter.finagle.{Service, ServiceFactory}
 import com.twitter.util.Future
-import org.jboss.netty.buffer.ChannelBuffer
+import org.jboss.netty.buffer.{ChannelBuffers, ChannelBuffer}
 
 object Client {
 
@@ -17,6 +17,7 @@ object Client {
       .hosts(host)
       .hostConnectionLimit(1)
       .codec(Redis())
+      .daemon(true)
       .build())
 
   /**
@@ -36,6 +37,7 @@ class Client(service: Service[Command, Reply])
   with Lists
   with Sets
   with BtreeSortedSetCommands
+  with HyperLogLogs
 
 /**
  * Connects to a single Redis host
@@ -50,6 +52,25 @@ class BaseClient(service: Service[Command, Reply]) {
   def auth(password: ChannelBuffer): Future[Unit] =
     doRequest(Auth(password)) {
       case StatusReply(message) => Future.Unit
+    }
+
+  /**
+   * Returns information and statistics about the server
+   * @param section Optional parameter can be used to select a specific section of information
+   * @return ChannelBuffer with collection of \r\n terminated lines if server has info on section
+   */
+  def info(section: ChannelBuffer = ChannelBuffers.EMPTY_BUFFER): Future[Option[ChannelBuffer]] =
+    doRequest(Info(section)) {
+      case BulkReply(message) => Future.value(Some(message))
+      case EmptyBulkReply() => Future.value(None)
+    }
+
+  /**
+   * Deletes all keys in all databases
+   */
+  def flushAll(): Future[Unit] =
+    doRequest(FlushAll) {
+      case StatusReply(_) => Future.Unit
     }
 
   /**
@@ -146,6 +167,7 @@ object TransactionalClient {
       .hosts(host)
       .hostConnectionLimit(1)
       .codec(Redis())
+      .daemon(true)
       .buildFactory())
 
   /**
@@ -166,11 +188,11 @@ private[redis] class ConnectedTransactionalClient(
 
   def transaction(cmds: Seq[Command]): Future[Seq[Reply]] = {
     serviceFactory() flatMap { svc =>
-      multi(svc) flatMap { _ =>
+      multi(svc) before {
         val cmdQueue = cmds map { cmd => svc(cmd) }
-        Future.collect(cmdQueue) flatMap { _ => exec(svc) }
+        Future.collect(cmdQueue).unit before exec(svc)
       } rescue { case e =>
-        svc(Discard) flatMap { _ =>
+        svc(Discard).unit before {
           Future.exception(ClientError("Transaction failed: " + e.toString))
         }
       } ensure {
@@ -189,7 +211,7 @@ private[redis] class ConnectedTransactionalClient(
   private def exec(svc: Service[Command, Reply]): Future[Seq[Reply]] =
     svc(Exec) flatMap {
       case MBulkReply(messages)  => Future.value(messages)
-      case EmptyMBulkReply()     => Future.value(Seq())
+      case EmptyMBulkReply()     => Future.Nil
       case NilMBulkReply()       => Future.exception(
         new ServerError("One or more keys were modified before transaction"))
       case ErrorReply(message)   => Future.exception(new ServerError(message))

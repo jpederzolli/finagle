@@ -56,16 +56,22 @@ class Redis(stats: StatsReceiver) extends CodecFactory[Command, Reply] {
       }
     }
 
+  override val protocolLibraryName: String = "redis"
 }
 
 private class RedisTracingFilter extends SimpleFilter[Command, Reply] {
-  override def apply(command: Command, service: Service[Command, Reply]) = Trace.unwind {
-    Trace.recordRpcname("redis", command.command)
-    Trace.record(Annotation.ClientSend())
-    service(command) map { response =>
-      Trace.record(Annotation.ClientRecv())
-      response
+  override def apply(command: Command, service: Service[Command, Reply]) = {
+    if (Trace.isActivelyTracing) {
+      Trace.recordServiceName("redis")
+      Trace.recordRpc(command.command)
+      Trace.record(Annotation.ClientSend())
+      service(command) map { response =>
+        Trace.record(Annotation.ClientRecv())
+        response
+      }
     }
+    else
+      service(command)
   }
 }
 
@@ -76,7 +82,7 @@ private class RedisLoggingFilter(stats: StatsReceiver)
   private[this] val succ  = stats.scope("success")
 
   override def apply(command: Command, service: Service[Command, Reply]) = {
-    service(command) map { response =>
+    service(command).map { response =>
       response match {
         case StatusReply(_)
           | IntegerReply(_)

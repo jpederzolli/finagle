@@ -11,7 +11,8 @@ trait Sets { self: BaseClient =>
   /**
    * Adds elements to the set, according to the set property.
    * Throws an exception if the key does not refer to a set.
-   * @params key, members
+   * @param key
+   * @param members
    * @return the number of new members added to the set.
    */
   def sAdd(key: ChannelBuffer, members: List[ChannelBuffer]): Future[JLong] =
@@ -27,14 +28,15 @@ trait Sets { self: BaseClient =>
    */
   def sMembers(key: ChannelBuffer): Future[ImmutableSet[ChannelBuffer]] =
     doRequest(SMembers(key)) {
-      case MBulkReply(list) => Future.value(ReplyFormat.toChannelBuffers(list) toSet)
+      case MBulkReply(list) => Future.value(ReplyFormat.toChannelBuffers(list).toSet)
       case EmptyMBulkReply() => Future.value(ImmutableSet())
     }
 
   /**
    * Is the member in the set?
    * Throws an exception if the key does not refer to a set.
-   * @params key, members
+   * @param key
+   * @param members
    * @return a boolean, true if it is in the set, false otherwise.  Unassigned
    * keys are considered empty sets.
    */
@@ -58,7 +60,8 @@ trait Sets { self: BaseClient =>
   /**
    * Removes the element from the set if it is in the set.
    * Throws an exception if the key does not refer to a set.
-   * @params key, member
+   * @param key
+   * @param member
    * @return an integer, the number of elements removed from the set, can be
    * 0 if the key is unassigned.
    */
@@ -77,5 +80,41 @@ trait Sets { self: BaseClient =>
     doRequest(SPop(key)) {
       case BulkReply(message) => Future.value(Some(message))
       case EmptyBulkReply() => Future.value(None)
+    }
+
+  /**
+    * Returns a list of random entries from the set. If the count is
+    * positive, a set is returned, otherwise a list that may contain
+    * duplicates is returned.
+    * @param key, count
+    * @return a sequence with count random entries from the set
+    */
+  def sRandMember(key: ChannelBuffer, count: Option[Int] = None): Future[Seq[ChannelBuffer]] =
+    doRequest(SRandMember(key, count)) {
+      case BulkReply(message) => Future.value(Seq(message))
+      case EmptyBulkReply() => Future.Nil
+      case MBulkReply(messages) => Future.value(ReplyFormat.toChannelBuffers(messages))
+      case EmptyMBulkReply() => Future.Nil
+    }
+
+  /**
+   * Returns the members of the set resulting from the intersection of all
+   * the given sets.
+   *
+   * Keys that do not exist are considered to be empty sets. With one of
+   * the keys being an empty set, the resulting set is also empty
+   * (since set intersection with an empty set always results in an empty set).
+   *
+   * Throws an exception if the `keys` Seq is empty or if any of the keys
+   * passed as params are empty.
+   *
+   * @param keys list of keys to intersect
+   * @return set of members from the resulting intersection
+   */
+  def sInter(keys: Seq[ChannelBuffer]): Future[ImmutableSet[ChannelBuffer]] =
+    doRequest(SInter(keys)) {
+      case MBulkReply(messages) =>
+        Future.value(ReplyFormat.toChannelBuffers(messages).toSet)
+      case EmptyMBulkReply() => Future.value(ImmutableSet())
     }
 }

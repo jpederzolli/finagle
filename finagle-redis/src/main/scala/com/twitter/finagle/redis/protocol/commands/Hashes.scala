@@ -18,6 +18,17 @@ case class HDel(key: ChannelBuffer, fields: Seq[ChannelBuffer]) extends StrictKe
   def toChannelBuffer = RedisCodec.toUnifiedFormat(Seq(CommandBytes.HDEL, key) ++ fields)
 }
 
+object HExists {
+  def apply(args: Seq[Array[Byte]]) = {
+    val list = trimList(args, 2, "HEXISTS")
+    new HExists(ChannelBuffers.wrappedBuffer(list(0)), ChannelBuffers.wrappedBuffer(list(1)))
+  }
+}
+case class HExists(key: ChannelBuffer, field: ChannelBuffer) extends StrictKeyCommand {
+  def command = Commands.HEXISTS
+  def toChannelBuffer = RedisCodec.toUnifiedFormat(Seq(CommandBytes.HEXISTS, key, field))
+}
+
 object HGet {
   def apply(args: Seq[Array[Byte]]) = {
     val list = trimList(args, 2, "HGET")
@@ -38,6 +49,19 @@ object HGetAll {
 case class HGetAll(key: ChannelBuffer) extends StrictKeyCommand {
   def command = Commands.HGETALL
   def toChannelBuffer = RedisCodec.toUnifiedFormat(Seq(CommandBytes.HGETALL, key))
+}
+
+case class HIncrBy(key: ChannelBuffer, field: ChannelBuffer, amount: Long) extends StrictKeyCommand {
+  def command = Commands.HINCRBY
+  def toChannelBuffer = RedisCodec.toUnifiedFormat(Seq(CommandBytes.HINCRBY, key, field, StringToChannelBuffer(amount.toString)))
+}
+object HIncrBy {
+  def apply(args: Seq[Array[Byte]]): Command = {
+    val amount = RequireClientProtocol.safe {
+      NumberFormat.toLong(BytesToString(args(2)))
+    }
+    HIncrBy(ChannelBuffers.wrappedBuffer(args(0)), ChannelBuffers.wrappedBuffer(args(1)), amount)
+  }
 }
 
 object HKeys {
@@ -86,7 +110,6 @@ object HMSet {
     new HMSet(key, fv)
   }
 }
-
 
 case class HScan(
   key: ChannelBuffer,
@@ -148,4 +171,32 @@ case class HSet(key: ChannelBuffer, field: ChannelBuffer, value: ChannelBuffer)
   extends StrictKeyCommand {
   def command = Commands.HSET
   def toChannelBuffer = RedisCodec.toUnifiedFormat(Seq(CommandBytes.HSET, key, field, value))
+}
+
+object HSetNx {
+  def apply(args: Seq[Array[Byte]]) = {
+    val list = trimList(args, 3, "HSETNX")
+    new HSetNx(
+      ChannelBuffers.wrappedBuffer(list(0)),
+      ChannelBuffers.wrappedBuffer(list(1)),
+      ChannelBuffers.wrappedBuffer(list(2)))
+  }
+}
+case class HSetNx(key: ChannelBuffer, field: ChannelBuffer, value: ChannelBuffer)
+  extends StrictKeyCommand {
+  def command = Commands.HSETNX
+  def toChannelBuffer = RedisCodec.toUnifiedFormat(Seq(CommandBytes.HSETNX, key, field, value))
+}
+
+
+object HVals {
+  def apply(args: Seq[Array[Byte]]) = {
+    val list = trimList(args, 1, "HSET")
+    new HVals(ChannelBuffers.wrappedBuffer(list(0)))
+  }
+}
+case class HVals(key: ChannelBuffer)
+  extends StrictKeyCommand {
+  def command = Commands.HVALS
+  def toChannelBuffer = RedisCodec.toUnifiedFormat(Seq(CommandBytes.HVALS, key))
 }

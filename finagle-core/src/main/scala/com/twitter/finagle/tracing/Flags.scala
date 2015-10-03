@@ -2,14 +2,24 @@ package com.twitter.finagle.tracing
 
 object Flags {
   /*
-   * The debug flag is used to ensure this the current trace passes all of the sampling stages.
+   * The debug flag is used to ensure this the current trace passes
+   * all of the sampling stages.
    */
   val Debug = 1L << 0 // 1
 
   /**
+   * Reserved for future use to encode sampling behavior, currently
+   * encoded explicitly in TraceId.sampled (Option[Boolean]).
+   */
+  val SamplingKnown = 1L << 1
+  val Sampled = 1L << 2
+
+  private[this] val Empty: Flags = Flags(0L)
+
+  /**
    * @return a flags instance with no flags set.
    */
-  def apply(): Flags = Flags(0L)
+  def apply(): Flags = Empty
 }
 
 /**
